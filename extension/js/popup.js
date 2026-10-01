@@ -1,12 +1,15 @@
-const API_URL = "https://api.mail.gw";
+const GUERRILLA_API = "https://api.guerrillamail.com/ajax.php";
+const MAIL_TM_API = "https://api.mail.tm";
+const MAIL_GW_API = "https://api.mail.gw";
 
 let currentAccount = null;
 let pollInterval = null;
-let knownMessageIds = new Set();
-let isFirstFetch = true;
+let cachedMessages = new Map();
 
 const stateLoading = document.getElementById("stateLoading");
+const loadingText = document.getElementById("loadingText");
 const stateNoAccount = document.getElementById("stateNoAccount");
+const createError = document.getElementById("createError");
 const stateActive = document.getElementById("stateActive");
 const stateMessageDetail = document.getElementById("stateMessageDetail");
 const btnCreate = document.getElementById("btnCreate");
@@ -30,6 +33,20 @@ const showState = (stateNode) => {
     stateNode.classList.remove("hidden");
 };
 
+const showError = (msg) => {
+    if (createError) {
+        createError.textContent = msg;
+        createError.classList.remove("hidden");
+    }
+};
+
+const clearError = () => {
+    if (createError) {
+        createError.textContent = "";
+        createError.classList.add("hidden");
+    }
+};
+
 const generateRandomString = (length = 10) => {
     const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
     const bytes = new Uint32Array(length);
@@ -43,110 +60,283 @@ const extractOTP = (text) => {
     return match ? match[0] : null;
 };
 
-const createAccount = async () => {
-    showState(stateLoading);
+// ── Storage Helpers (RAM-only Session Storage for Security) ──
+const saveAccountToStorage = async (account) => {
     try {
-        const domainRes = await fetch(`${API_URL}/domains`);
-        if (!domainRes.ok) throw new Error("Failed to load domains");
-        const domainsData = await domainRes.json();
-        const members = domainsData['hydra:member'];
-        if (!Array.isArray(members) || !members[0]?.domain) throw new Error("No domain available");
-        const domain = members[0].domain;
-        const address = `${generateRandomString()}@${domain}`;
-        const password = generateRandomString(18);
+        if (chrome.storage?.session) {
+            await chrome.storage.session.set({ mephistoAccount: account });
+        }
+    } catch {}
+};
 
-        const accRes = await fetch(`${API_URL}/accounts`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ address, password })
-        });
-        const accData = await accRes.json().catch(() => ({}));
-        if (!accRes.ok) throw new Error(accData.message || "Failed to create account");
+const getAccountFromStorage = async () => {
+    try {
+        if (chrome.storage?.session) {
+            const res = await chrome.storage.session.get(["mephistoAccount"]);
+            if (res?.mephistoAccount?.address) return res.mephistoAccount;
+        }
+    } catch {}
+    return null;
+};
 
-        const tokenRes = await fetch(`${API_URL}/token`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-            body: JSON.stringify({ address, password })
-        });
-        const tokenData = await tokenRes.json().catch(() => ({}));
-        if (!tokenRes.ok || !tokenData.token) throw new Error("Failed to authenticate");
+const removeAccountFromStorage = async () => {
+    try {
+        if (chrome.storage?.session) await chrome.storage.session.remove(["mephistoAccount"]);
+    } catch {}
+};
 
-        currentAccount = { id: accData.id, address, password, token: tokenData.token };
-        await chrome.storage.session.set({ mephistoAccount: currentAccount });
-        isFirstFetch = true;
-        knownMessageIds.clear();
+// ── Provider 1: Guerrilla Mail (Primary & Fastest) ──
+const createGuerrillaMailbox = async () => {
+    const res = await fetch(`${GUERRILLA_API}?f=get_email_address`, { cache: 'no-store' });
+    if (!res.ok) throw new Error(`Guerrilla HTTP ${res.status}`);
+    const data = await res.json();
+    if (!data?.email_addr || !data?.sid_token) throw new Error("Invalid Guerrilla response");
+
+    return {
+        id: data.sid_token,
+        address: data.email_addr,
+        provider: 'guerrilla',
+        token: data.sid_token,
+        createdAt: Date.now()
+    };
+};
+
+const fetchGuerrillaMessages = async (token) => {
+    const res = await fetch(`${GUERRILLA_API}?f=get_email_list&offset=0&sid_token=${encodeURIComponent(token)}`, { cache: 'no-store' });
+    if (!res.ok) throw new Error(`Guerrilla fetch failed: HTTP ${res.status}`);
+    const data = await res.json();
+    const list = Array.isArray(data?.list) ? data.list : [];
+
+    return list.map(m => ({
+        id: String(m.mail_id),
+        from: { name: m.mail_from || 'Unknown', address: m.mail_from || '' },
+        subject: m.mail_subject || '(No subject)',
+        intro: m.mail_excerpt || '',
+        date: m.mail_date || '',
+        seen: m.mail_read === 1 || m.mail_read === '1',
+        rawBody: m.mail_body || ''
+    }));
+};
+
+const fetchGuerrillaDetail = async (token, id) => {
+    const res = await fetch(`${GUERRILLA_API}?f=fetch_email&email_id=${encodeURIComponent(id)}&sid_token=${encodeURIComponent(token)}`, { cache: 'no-store' });
+    if (!res.ok) throw new Error(`Guerrilla detail failed: HTTP ${res.status}`);
+    const data = await res.json();
+    return {
+        from: data.mail_from || '',
+        subject: data.mail_subject || '(No subject)',
+        html: data.mail_body || '',
+        text: data.mail_excerpt || ''
+    };
+};
+
+// ── Provider 2: Hydra (Mail.tm / Mail.gw Fallback) ──
+const createHydraMailbox = async (apiBase) => {
+    const domainRes = await fetch(`${apiBase}/domains`, { cache: 'no-store' });
+    if (!domainRes.ok) throw new Error(`${apiBase} domains failed: HTTP ${domainRes.status}`);
+    const domainsData = await domainRes.json();
+    const members = domainsData['hydra:member'];
+    if (!Array.isArray(members) || !members[0]?.domain) throw new Error("No Hydra domain available");
+    const domain = members[0].domain;
+    const address = `${generateRandomString()}@${domain}`;
+    const password = generateRandomString(18);
+
+    const accRes = await fetch(`${apiBase}/accounts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ address, password })
+    });
+    const accData = await accRes.json().catch(() => ({}));
+    if (!accRes.ok) throw new Error(accData.message || "Failed to create Hydra account");
+
+    const tokenRes = await fetch(`${apiBase}/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({ address, password })
+    });
+    const tokenData = await tokenRes.json().catch(() => ({}));
+    if (!tokenRes.ok || !tokenData.token) throw new Error("Failed to authenticate with Hydra");
+
+    return {
+        id: accData.id,
+        address,
+        provider: 'hydra',
+        apiBase,
+        token: tokenData.token,
+        password,
+        createdAt: Date.now()
+    };
+};
+
+const fetchHydraMessages = async (apiBase, token) => {
+    const res = await fetch(`${apiBase}/messages`, {
+        headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/ld+json' },
+        cache: 'no-store'
+    });
+    if (!res.ok) throw new Error(`Hydra messages failed: HTTP ${res.status}`);
+    const data = await res.json();
+    const members = Array.isArray(data?.['hydra:member']) ? data['hydra:member'].filter(m => !m.isDeleted) : [];
+
+    return members.map(m => ({
+        id: String(m.id),
+        from: { name: m.from?.name || m.from?.address || 'Unknown', address: m.from?.address || '' },
+        subject: m.subject || '(No subject)',
+        intro: m.intro || '',
+        date: m.createdAt || '',
+        seen: Boolean(m.seen),
+        rawBody: ''
+    }));
+};
+
+const fetchHydraDetail = async (apiBase, token, id) => {
+    const res = await fetch(`${apiBase}/messages/${encodeURIComponent(id)}`, {
+        headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/ld+json' },
+        cache: 'no-store'
+    });
+    if (!res.ok) throw new Error(`Hydra detail failed: HTTP ${res.status}`);
+    const msg = await res.json();
+    return {
+        from: msg.from?.name ? `${msg.from.name} <${msg.from.address}>` : (msg.from?.address || ''),
+        subject: msg.subject || '(No subject)',
+        html: msg.html?.[0] || '',
+        text: msg.text || ''
+    };
+};
+
+// ── Multi-Provider Orchestrator ──
+const createAccount = async () => {
+    clearError();
+    if (loadingText) loadingText.textContent = "Connecting to secure provider...";
+    showState(stateLoading);
+
+    try {
+        // Step 1: Try Guerrilla Mail (instant, highest reliability)
+        try {
+            currentAccount = await createGuerrillaMailbox();
+        } catch (guerrillaErr) {
+            console.warn("Guerrilla creation failed, trying Mail.tm...", guerrillaErr);
+            if (loadingText) loadingText.textContent = "Trying backup provider...";
+            
+            // Step 2: Try Mail.tm
+            try {
+                currentAccount = await createHydraMailbox(MAIL_TM_API);
+            } catch (mailTmErr) {
+                console.warn("Mail.tm creation failed, trying Mail.gw...", mailTmErr);
+                
+                // Step 3: Try Mail.gw
+                currentAccount = await createHydraMailbox(MAIL_GW_API);
+            }
+        }
+
+        await saveAccountToStorage(currentAccount);
+        cachedMessages.clear();
         renderActiveState();
         fetchMessages();
         startPolling();
     } catch (err) {
-        console.error("Account creation failed:", err);
+        console.error("All providers failed to create mailbox:", err);
         showState(stateNoAccount);
+        showError("Unable to create mailbox. Please check your internet connection and try again.");
     }
 };
 
 const deleteAccount = async () => {
     if (!currentAccount) return;
     showState(stateLoading);
+    if (loadingText) loadingText.textContent = "Destroying mailbox...";
     stopPolling();
+
     try {
-        await fetch(`${API_URL}/accounts/${encodeURIComponent(currentAccount.id)}`, {
-            method: 'DELETE', headers: { 'Authorization': `Bearer ${currentAccount.token}` }
-        });
-    } catch (err) { console.warn("Account deletion request failed", err); }
-    await chrome.storage.session.remove(["mephistoAccount"]);
+        if (currentAccount.provider === 'guerrilla') {
+            await fetch(`${GUERRILLA_API}?f=del_email&email_ids%5B%5D=all&sid_token=${encodeURIComponent(currentAccount.token)}`).catch(() => {});
+        } else if (currentAccount.provider === 'hydra' && currentAccount.apiBase) {
+            await fetch(`${currentAccount.apiBase}/accounts/${encodeURIComponent(currentAccount.id)}`, {
+                method: 'DELETE',
+                headers: { 'Authorization': `Bearer ${currentAccount.token}` }
+            }).catch(() => {});
+        }
+    } catch (err) {
+        console.warn("Account deletion request failed", err);
+    }
+
+    await removeAccountFromStorage();
     currentAccount = null;
-    chrome.action.setBadgeText({ text: "" });
+    cachedMessages.clear();
+    try {
+        chrome.action.setBadgeText({ text: "" });
+    } catch {}
+    clearError();
     showState(stateNoAccount);
 };
 
 const fetchMessages = async () => {
     if (!currentAccount) return;
     try {
-        const res = await fetch(`${API_URL}/messages`, { headers: { 'Authorization': `Bearer ${currentAccount.token}` } });
-        if (res.ok) {
-            const data = await res.json();
-            const activeMsgs = Array.isArray(data['hydra:member']) ? data['hydra:member'].filter(m => !m.isDeleted) : [];
-            renderMessages(activeMsgs);
+        let activeMsgs = [];
+        if (currentAccount.provider === 'guerrilla') {
+            activeMsgs = await fetchGuerrillaMessages(currentAccount.token);
+        } else if (currentAccount.provider === 'hydra' || currentAccount.token) {
+            const apiBase = currentAccount.apiBase || MAIL_TM_API;
+            activeMsgs = await fetchHydraMessages(apiBase, currentAccount.token);
         }
-    } catch (err) { console.warn("Message fetch failed", err); }
+
+        // Cache message details in memory
+        activeMsgs.forEach(m => cachedMessages.set(m.id, m));
+        renderMessages(activeMsgs);
+    } catch (err) {
+        console.warn("Message fetch failed", err);
+    }
 };
 
 const fetchMessageDetail = async (id) => {
     detailLoading.classList.remove("hidden");
     detailFrame.classList.add("hidden");
     showState(stateMessageDetail);
+
     try {
-        const res = await fetch(`${API_URL}/messages/${encodeURIComponent(id)}`, { headers: { 'Authorization': `Bearer ${currentAccount.token}` } });
-        if (!res.ok) throw new Error("Unable to load message");
-        const msg = await res.json();
-        detailFrom.textContent = `From: ${msg.from?.name || ''} <${msg.from?.address || ''}>`;
-        detailSubject.textContent = msg.subject || '';
+        let msg = null;
+        if (currentAccount?.provider === 'guerrilla') {
+            msg = await fetchGuerrillaDetail(currentAccount.token, id);
+        } else if (currentAccount?.provider === 'hydra' || currentAccount?.token) {
+            const apiBase = currentAccount.apiBase || MAIL_TM_API;
+            msg = await fetchHydraDetail(apiBase, currentAccount.token, id);
+        }
+
+        if (!msg) throw new Error("No message data returned");
+
+        detailFrom.textContent = `From: ${msg.from}`;
+        detailSubject.textContent = msg.subject;
 
         const doc = detailFrame.contentDocument;
         if (!doc) throw new Error("Message frame unavailable");
         doc.open();
-        const body = msg.html?.[0] || `<pre style="white-space:pre-wrap;font-family:sans-serif;padding:12px;"></pre>`;
-        doc.write(`<!doctype html><html><head><meta charset="UTF-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src https: data:; style-src 'unsafe-inline';"><style>body{font-family:sans-serif;padding:12px;word-break:break-word}img{max-width:100%;height:auto}</style></head><body></body></html>`);
+        doc.write(`<!doctype html><html><head><meta charset="UTF-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src https: data:; style-src 'unsafe-inline';"><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:12px;word-break:break-word;color:#111827;line-height:1.5}img{max-width:100%;height:auto}pre{white-space:pre-wrap;font-family:inherit;}</style></head><body></body></html>`);
         doc.close();
+
         const bodyNode = doc.body;
-        if (msg.html?.[0]) {
+        if (msg.html) {
             const template = doc.createElement('template');
-            template.innerHTML = String(body);
+            template.innerHTML = String(msg.html);
             template.content.querySelectorAll('script,iframe,object,embed,form,input,textarea,button').forEach(node => node.remove());
             template.content.querySelectorAll('*').forEach(node => {
                 [...node.attributes].forEach(attr => {
-                    if (/^on/i.test(attr.name) || /^(javascript|data|file|blob|chrome|resource):/i.test(attr.value.trim())) node.removeAttribute(attr.name);
+                    if (/^on/i.test(attr.name) || /^(javascript|data|file|blob|chrome|resource):/i.test(attr.value.trim())) {
+                        node.removeAttribute(attr.name);
+                    }
                 });
             });
             bodyNode.replaceChildren(template.content.cloneNode(true));
         } else {
             const pre = doc.createElement('pre');
-            pre.style.cssText = 'white-space:pre-wrap;font-family:sans-serif;padding:12px;';
             pre.textContent = msg.text || '';
             bodyNode.replaceChildren(pre);
         }
+
         detailLoading.classList.add("hidden");
         detailFrame.classList.remove("hidden");
     } catch (err) {
-        detailLoading.textContent = "Error loading message.";
+        console.error("Error loading message detail:", err);
+        detailLoading.textContent = "Error loading message. Please go back and try again.";
     }
 };
 
@@ -157,13 +347,16 @@ const renderActiveState = () => {
 
 const renderMessages = (activeMsgs) => {
     msgCount.textContent = String(activeMsgs.length);
-    chrome.action.setBadgeText({ text: activeMsgs.length > 0 ? String(activeMsgs.length) : "" });
-    chrome.action.setBadgeBackgroundColor({ color: "#dc2626" });
+    try {
+        chrome.action.setBadgeText({ text: activeMsgs.length > 0 ? String(activeMsgs.length) : "" });
+        chrome.action.setBadgeBackgroundColor({ color: "#dc2626" });
+    } catch {}
+
     messageList.replaceChildren();
     if (activeMsgs.length === 0) {
         const empty = document.createElement('li');
         empty.className = 'empty-state';
-        empty.textContent = 'No emails yet. Waiting for email...';
+        empty.textContent = 'No emails yet. Waiting for incoming mail...';
         messageList.appendChild(empty);
         return;
     }
@@ -193,17 +386,18 @@ const renderMessages = (activeMsgs) => {
             copyButton.textContent = `Copy ${otpMatch}`;
             copyButton.dataset.otp = otpMatch;
             copyButton.title = 'Copy OTP';
-            copyButton.style.cssText = 'padding:4px 8px;border:1px solid var(--border-color);border-radius:6px;font-size:12px;font-weight:600;background:var(--bg-dark);color:var(--text-primary);transition:all .2s;';
+            copyButton.style.cssText = 'padding:4px 8px;border:1px solid var(--border-color);border-radius:6px;font-size:12px;font-weight:600;background:var(--bg-dark);color:var(--text-primary);transition:all .2s;cursor:pointer;';
             row.appendChild(copyButton);
         }
         li.appendChild(row);
         li.addEventListener('click', async (e) => {
             const copyBtn = e.target.closest('.copy-otp-btn');
             if (copyBtn) {
+                e.stopPropagation();
                 try { await navigator.clipboard.writeText(copyBtn.dataset.otp || ''); } catch {}
                 const previous = copyBtn.textContent;
                 copyBtn.textContent = 'Copied';
-                copyBtn.style.color = 'var(--success, #22c55e)';
+                copyBtn.style.color = '#22c55e';
                 setTimeout(() => { copyBtn.textContent = previous; copyBtn.style.color = 'var(--text-primary)'; }, 1500);
                 return;
             }
@@ -215,18 +409,26 @@ const renderMessages = (activeMsgs) => {
 
 const startPolling = () => {
     if (pollInterval) clearInterval(pollInterval);
-    pollInterval = setInterval(fetchMessages, 5000);
+    pollInterval = setInterval(fetchMessages, 4000);
 };
-const stopPolling = () => { if (pollInterval) clearInterval(pollInterval); };
+
+const stopPolling = () => {
+    if (pollInterval) {
+        clearInterval(pollInterval);
+        pollInterval = null;
+    }
+};
 
 btnCreate.addEventListener('click', createAccount);
 btnDelete.addEventListener('click', deleteAccount);
 btnBackToInbox.addEventListener('click', renderActiveState);
+
 btnRefresh.addEventListener('click', () => {
     const icon = btnRefresh.querySelector("svg");
     icon?.classList.add("spinner");
     fetchMessages().finally(() => icon?.classList.remove("spinner"));
 });
+
 btnCopy.addEventListener('click', async () => {
     if (!currentAccount?.address) return;
     try { await navigator.clipboard.writeText(currentAccount.address); } catch {}
@@ -235,9 +437,10 @@ btnCopy.addEventListener('click', async () => {
     setTimeout(() => { btnCopy.innerHTML = original; }, 1500);
 });
 
-chrome.storage.session.get(["mephistoAccount"]).then(result => {
-    if (result.mephistoAccount?.token) {
-        currentAccount = result.mephistoAccount;
+// Initialize on popup open
+getAccountFromStorage().then(account => {
+    if (account?.address && account?.token) {
+        currentAccount = account;
         renderActiveState();
         fetchMessages();
         startPolling();

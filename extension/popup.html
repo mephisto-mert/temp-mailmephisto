@@ -33,7 +33,7 @@
                     <line x1="4.93" y1="19.07" x2="7.76" y2="16.24"></line>
                     <line x1="16.24" y1="7.76" x2="19.07" y2="4.93"></line>
                 </svg>
-                <p>Connecting securely...</p>
+                <p id="loadingText">Connecting securely...</p>
             </div>
 
             <!-- No Account State -->
@@ -46,6 +46,7 @@
                 </div>
                 <p class="desc">Generate a RAM-only temporary email instantly.<br>OTP codes will be automatically
                     injected.</p>
+                <div id="createError" class="error-msg hidden"></div>
                 <button id="btnCreate" class="btn primary">Generate Email Address</button>
             </div>
 

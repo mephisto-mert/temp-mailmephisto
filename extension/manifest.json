@@ -25,8 +25,8 @@
     "activeTab"
   ],
   "host_permissions": [
-    "https://api.mail.gw/*",
+    "https://api.guerrillamail.com/*",
     "https://api.mail.tm/*",
-    "https://api.guerrillamail.com/*"
+    "https://api.mail.gw/*"
   ]
 }
